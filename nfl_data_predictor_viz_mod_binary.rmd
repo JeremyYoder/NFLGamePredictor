@@ -1,0 +1,1095 @@
+---
+title: "nfl_data_predictor_viz"
+author: "Jeff"
+date: "9/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Dependencies
+```{r}
+# install.packages('devtools')
+library(devtools) 
+install_github("AppliedDataSciencePartners/xgboostExplainer")
+library(xgboost)
+library(caret)
+library(OptimalCutpoints)
+library(xgboostExplainer)
+library(pROC)
+library(SHAPforxgboost)
+library(randomForest)
+library(rpart) 
+library(splitstackshape)
+library(tidyverse)
+library(Metrics)
+library(elo)
+```
+
+## Creating the Play-by_Play Aggregations with a 15-Week Lag
+```{r}
+# Load Data
+
+load("nfl_pbp_1999_2020.rda")
+# Extract Games
+pbp_2018_2020 <- pbp
+games <- unique(pbp_2018_2020[, c(2,4,5,7,284,322, 323)])
+
+# Drop games after week 15
+pbp_use <- pbp_2018_2020[pbp_2018_2020$week <= 15,]
+
+
+# Create index for play by play
+pbp_index <- rep(NA, nrow(pbp_use))
+
+for(i in 1:nrow(pbp_use)){
+  if(pbp_use$season[i] == 1999){
+    pbp_index[i] <- pbp_use$week[i]
+  } else if (pbp_use$season[i] == 2000){
+    pbp_index[i] <- pbp_use$week[i] + 15
+  } else if (pbp_use$season[i] == 2001){
+    pbp_index[i] <- pbp_use$week[i] + 30
+  } else if (pbp_use$season[i] == 2002){
+    pbp_index[i] <- pbp_use$week[i] + 45
+  } else if (pbp_use$season[i] == 2003){
+    pbp_index[i] <- pbp_use$week[i] + 60
+  } else if (pbp_use$season[i] == 2004){
+    pbp_index[i] <- pbp_use$week[i] + 75
+  } else if (pbp_use$season[i] == 2005){
+    pbp_index[i] <- pbp_use$week[i] + 90
+  } else if (pbp_use$season[i] == 2006){
+    pbp_index[i] <- pbp_use$week[i] + 105
+  } else if (pbp_use$season[i] == 2007){
+    pbp_index[i] <- pbp_use$week[i] + 120
+  } else if (pbp_use$season[i] == 2008){
+    pbp_index[i] <- pbp_use$week[i] + 135
+  } else if (pbp_use$season[i] == 2009){
+    pbp_index[i] <- pbp_use$week[i] + 150
+  } else if (pbp_use$season[i] == 2010){
+    pbp_index[i] <- pbp_use$week[i] + 165
+  } else if (pbp_use$season[i] == 2011){
+    pbp_index[i] <- pbp_use$week[i] + 180
+  } else if (pbp_use$season[i] == 2012){
+    pbp_index[i] <- pbp_use$week[i] + 195
+  } else if (pbp_use$season[i] == 2013){
+    pbp_index[i] <- pbp_use$week[i] + 210
+  } else if (pbp_use$season[i] == 2014){
+    pbp_index[i] <- pbp_use$week[i] + 225
+  } else if (pbp_use$season[i] == 2015){
+    pbp_index[i] <- pbp_use$week[i] + 240
+  } else if (pbp_use$season[i] == 2016){
+    pbp_index[i] <- pbp_use$week[i] + 255
+  } else if (pbp_use$season[i] == 2017){
+    pbp_index[i] <- pbp_use$week[i] + 270
+  } else if (pbp_use$season[i] == 2018){
+    pbp_index[i] <- pbp_use$week[i] + 300
+  } else if (pbp_use$season[i] == 2019){
+    pbp_index[i] <- pbp_use$week[i] + 315
+  } else if (pbp_use$season[i] == 2020){
+    pbp_index[i] <- pbp_use$week[i] + 330
+  } 
+}
+
+pbp_use$index <- pbp_index
+
+games <- unique(pbp_use[, c(2,4,5,7,284,322, 323, 371)])
+
+#### Define Functions for calculations
+
+epa_calculator_off <- function(data, week_lag = 5, db){
+  #'
+  #' This function calculates the average EPA for each team for 
+  #' different play types. 
+  #' 
+  #' @param data The play-by-play dataset
+  #' @param week_lag The number of weeks to use to calculate averages
+  #' @param db The games to create stats for 
+  #' 
+  #' @return A data frame with the calculated values for each of the teams
+  #'
+  #'
+  
+  # Create empty columns to store results
+  hrun_epa <- hrun_freq <- hpass_epa <- hpass_freq <- rep(NA, nrow(db))
+  hgames <- rep(NA, nrow(db))
+  
+  arun_epa <- arun_freq <- apass_epa <- apass_freq <- rep(NA, nrow(db))
+  agames <- rep(NA, nrow(db))
+  
+  # For each game
+  for(i in 1:nrow(db)){
+    # Calculate start index
+    start_index <- max(1, db$index[i] - week_lag - 1)
+    # Calculate end index
+    end_index <- db$index[i] - 1
+    # Extract plays involving teams of interest falling in window
+    temp <- data[which(data$index > start_index & 
+                         data$index <= end_index &
+                         data$posteam %in% c(db$home_team[i], db$away_team[i]) &
+                         data$season == data$season[i]),]
+    # If any such plays exist
+    if(nrow(temp) >0 ){
+      # Calculate total home run epa
+      hrun_epa[i] <- sum(temp$epa[which(temp$play_type == "run" & 
+                                          temp$posteam == db$home_team[i])], na.rm = T)
+      # Calculate total home run plays
+      hrun_freq[i] <- nrow(temp[which(temp$play_type == "run" & 
+                                        temp$posteam == db$home_team[i]),])
+      # Calculate total home pass epa
+      hpass_epa[i] <- sum(temp$epa[which(temp$play_type == "pass" & 
+                                           temp$posteam == db$home_team[i])], na.rm = T)
+      # Calculate total home pass plays
+      hpass_freq[i] <- nrow(temp[which(temp$play_type == "pass" & 
+                                         temp$posteam == db$home_team[i]),])
+      
+      # Calculate total home number of games played
+      hgames[i] <- length(unique(na.omit(temp$game_id[which(temp$posteam == db$home_team[i])])))
+      
+      # Calculate total away run epa
+      arun_epa[i] <- sum(temp$epa[which(temp$play_type == "run" & 
+                                          temp$posteam == db$away_team[i])], na.rm = T)
+      # Calculate total away run plays
+      arun_freq[i] <- nrow(temp[which(temp$play_type == "run" & 
+                                        temp$posteam == db$away_team[i]),])
+      # Calculate total away pass epa
+      apass_epa[i] <- sum(temp$epa[which(temp$play_type == "pass" & 
+                                           temp$posteam == db$away_team[i])], na.rm = T)
+      # Calculate total away pass plays
+      apass_freq[i] <- nrow(temp[which(temp$play_type == "pass" & 
+                                         temp$posteam == db$away_team[i]),])
+      
+      # Calculate total number of away games played
+      agames[i] <- length(unique(na.omit(temp$game_id[which(temp$posteam == db$away_team[i])])))
+    }
+    
+  }
+  # Calculate averages per play
+  havg_run_epa <- hrun_epa/hrun_freq
+  havg_pass_epa <- hpass_epa/hpass_freq
+  
+  # Calculate play type frequency per play
+  hruns_per_game <- hrun_freq/hgames
+  hpass_per_game <- hpass_freq/hgames
+  
+  # Calculate averages per play
+  aavg_run_epa <- arun_epa/arun_freq
+  aavg_pass_epa <- apass_epa/apass_freq
+  
+  # Calculate play type frequency per play
+  aruns_per_game <- arun_freq/agames
+  apass_per_game <- apass_freq/agames
+  
+  # Join results columns
+  res_dat <- cbind.data.frame(hrun_epa, hrun_freq, hpass_epa, hpass_freq, 
+                              havg_run_epa, havg_pass_epa,  hgames,
+                              hruns_per_game, hpass_per_game,
+                              arun_epa, arun_freq, apass_epa, apass_freq, 
+                              aavg_run_epa, aavg_pass_epa,  agames,
+                              aruns_per_game, apass_per_game)
+  
+  # Fill missing with 0
+  #res_dat[is.na(res_dat)] <- 0
+  # Return Results
+  return(res_dat)
+}
+
+
+
+epa_calculator_def <- function(data, week_lag = 5, db){
+  #'
+  #' This function calculates the average EPA for each team for 
+  #' different play types. 
+  #' 
+  #' @param data The play-by-play dataset
+  #' @param week_lag The number of weeks to use to calculate averages
+  #' @param db The games to create stats for 
+  #' 
+  #' @return A data frame with the calculated values for each of the teams
+  #'
+  #'
+  
+  # Create empty columns to store results
+  hrun_epa <- hrun_freq <- hpass_epa <- hpass_freq <- rep(NA, nrow(db))
+  hgames <- rep(NA, nrow(db))
+  
+  arun_epa <- arun_freq <- apass_epa <- apass_freq <- rep(NA, nrow(db))
+  agames <- rep(NA, nrow(db))
+  
+  # For each game
+  for(i in 1:nrow(db)){
+    # Calculate start index
+    start_index <- max(1, db$index[i] - week_lag - 1)
+    # Calculate end index
+    end_index <- db$index[i] - 1
+    # Extract plays involving teams of interest falling in window
+    temp <- data[which(data$index > start_index & 
+                         data$index <= end_index &
+                         data$defteam %in% c(db$home_team[i], db$away_team[i]) &
+                         data$season == data$season[i]),]
+    # If any such plays exist
+    if(nrow(temp) >0 ){
+      # Calculate total home run epa
+      hrun_epa[i] <- sum(temp$epa[which(temp$play_type == "run" & 
+                                          temp$defteam == db$home_team[i])], na.rm = T)
+      # Calculate total home run plays
+      hrun_freq[i] <- nrow(temp[which(temp$play_type == "run" & 
+                                        temp$defteam == db$home_team[i]),])
+      # Calculate total home pass epa
+      hpass_epa[i] <- sum(temp$epa[which(temp$play_type == "pass" & 
+                                           temp$defteam == db$home_team[i])], na.rm = T)
+      # Calculate total home pass plays
+      hpass_freq[i] <- nrow(temp[which(temp$play_type == "pass" & 
+                                         temp$defteam == db$home_team[i]),])
+      
+      # Calculate total home number of games played
+      hgames[i] <- length(unique(na.omit(temp$game_id[which(temp$defteam == db$home_team[i])])))
+      
+      # Calculate total away run epa
+      arun_epa[i] <- sum(temp$epa[which(temp$play_type == "run" & 
+                                          temp$defteam == db$away_team[i])], na.rm = T)
+      # Calculate total away run plays
+      arun_freq[i] <- nrow(temp[which(temp$play_type == "run" & 
+                                        temp$defteam == db$away_team[i]),])
+      # Calculate total away pass epa
+      apass_epa[i] <- sum(temp$epa[which(temp$play_type == "pass" & 
+                                           temp$defteam == db$away_team[i])], na.rm = T)
+      # Calculate total away pass plays
+      apass_freq[i] <- nrow(temp[which(temp$play_type == "pass" & 
+                                         temp$defteam == db$away_team[i]),])
+      
+      # Calculate total number of away games played
+      agames[i] <- length(unique(na.omit(temp$game_id[which(temp$defteam == db$away_team[i])])))
+    }
+    
+  }
+  # Calculate averages per play
+  havg_run_epa <- hrun_epa/hrun_freq
+  havg_pass_epa <- hpass_epa/hpass_freq
+  
+  # Calculate play type frequency per play
+  hruns_per_game <- hrun_freq/hgames
+  hpass_per_game <- hpass_freq/hgames
+  
+  # Calculate averages per play
+  aavg_run_epa <- arun_epa/arun_freq
+  aavg_pass_epa <- apass_epa/apass_freq
+  
+  # Calculate play type frequency per play
+  aruns_per_game <- arun_freq/agames
+  apass_per_game <- apass_freq/agames
+  
+  # Join results columns
+  res_dat <- cbind.data.frame(hrun_epa, hrun_freq, hpass_epa, hpass_freq, 
+                              havg_run_epa, havg_pass_epa,  hgames,
+                              hruns_per_game, hpass_per_game,
+                              arun_epa, arun_freq, apass_epa, apass_freq, 
+                              aavg_run_epa, aavg_pass_epa,  agames,
+                              aruns_per_game, apass_per_game)
+  # Change names to indicate defense
+  names(res_dat) <- paste(names(res_dat), "_def")
+  # Fill missing with 0
+  #res_dat[is.na(res_dat)] <- 0
+  # Return Results
+  return(res_dat)
+}
+
+
+
+### Calculate stats
+
+# Calculate offensive stats
+off_stats <- epa_calculator_off(data = pbp_use, week_lag = 15, db = games)
+
+# Calculate defensive stats
+def_stats <- epa_calculator_def(data = pbp_use, week_lag = 15, db = games)
+
+mod_dat <- cbind.data.frame(games, off_stats, def_stats)
+```
+
+## Wrangling mod_dat to Add Response Variables and Handle Missing Values
+```{r}
+
+# Create columns for a winner flag and the point differential
+winner <- point_dif <- rep(NA, nrow(mod_dat))
+
+# Loop over each row to determine if the home team won and calculate the point differential
+for (i in 1:nrow(mod_dat)) {
+  if (mod_dat$home_score[i] > mod_dat$away_score[i]) {
+    winner[i] <- 1
+    point_dif[i] <- mod_dat$home_score[i] - mod_dat$away_score[i]
+  }
+  else if (mod_dat$home_score[i] < mod_dat$away_score[i]) {
+    winner[i] <- 0
+    point_dif[i] <- mod_dat$home_score[i] - mod_dat$away_score[i]
+  }
+}
+
+# Assign the winner and point_dif vectors to columns in the mod_dat df
+mod_dat$winner <- winner
+mod_dat$point_dif <- point_dif
+
+# Drop rows with ties
+mod_dat <- mod_dat[!is.na(mod_dat$winner), ]
+
+# Fix variable data types
+ mod_dat <- mod_dat %>%
+   mutate(season = as.factor(season),
+          winner = as.factor(winner))
+ 
+ # Eliminate games with index 1 and 2, where there is no data available
+ mod_dat2 <- mod_dat[mod_dat$index >= 3, ]
+```
+
+
+## Calculating ELO Ratings
+```{r}
+
+teams <- unique(c(mod_dat2$home_team, mod_dat2$away_team))
+elo <- rep(1500, length(teams))
+
+# Join teams and initial elo rating
+teams <- cbind.data.frame(teams, rep(1500, length(teams)))
+# Name columns
+names(teams) <- c("teams", "elo")
+# View first few rows of teams
+head(teams)
+
+# Create vectors to store ELO
+elo_vec_1 <- elo_vec_2 <- rep(NA, nrow(mod_dat2))
+
+# For each match in our dataset
+for(i in 1:nrow(mod_dat2)){
+  if(i > 2){
+    if(mod_dat2$season[i] != mod_dat2$season[i-1]){
+      teams$elo <- 1500
+    }
+  }
+  # Extract match
+  match <- mod_dat2[i,]
+  
+  # Extract team 1 Elo
+  team1_elo <- teams$elo[teams$team == mod_dat2$home_team[i]]
+  # Extract team 2 Elo
+  team2_elo <- teams$elo[teams$team ==  mod_dat2$away_team[i]]
+  
+  # Store elo values
+  elo_vec_1[i] <- team1_elo
+  elo_vec_2[i] <- team2_elo
+  
+  # Calculate new Elo ratings
+  new_elo <- elo.calc(wins.A = as.numeric(mod_dat2$winner[i]) -1,
+                      elo.A = team1_elo,
+                      elo.B = team2_elo,
+                      k= 100)
+  
+  # Store new elo ratings for home team
+  teams$elo[teams$team ==mod_dat2$home_team[i]] <- new_elo[1,1]
+  # Store new elo ratings for away team
+  teams$elo[teams$team == mod_dat2$away_team[i]] <- new_elo[1,2]
+}
+
+```
+
+## Increasing the Sample Size
+```{r}
+
+# Extract game level stats
+game_stats <- mod_dat2[,c(1:8, 45,46)]
+# Extract home stats
+hstats <- mod_dat2[,c(2,9:17, 27:35)]
+# Extract away stats
+astats <- mod_dat2[,c(3, 18:26,36:44)]
+
+# Fix names
+names(hstats) <- names(astats) <- c("team", "run_epa", "run_freq", "pass_epa", "pass_freq",         
+                   "avg_run_epa", "avg_pass_epa", "games", "runs_per_game",     
+                   "pass_per_game", "run_epa_def", "run_freq_def",     
+                   "pass_epa_def", "pass_freq_def", "avg_run_epa_def",
+                   "avg_pass_epa_def", 
+                   "games_def", "runs_per_game_def", "pass_per_game_def")
+# Create copy of home stats
+hstats_1 <- hstats
+# Append opp to names for copy of home stats
+names(hstats_1) <- paste(names(hstats), "_opp", sep = "")
+
+# Create copy of away stats
+astats_1 <- astats
+# Append opp to names for copy of away stats
+names(astats_1) <- paste(names(astats), "_opp", sep = "")
+
+# Join original home and copy of away
+data_1 <- cbind.data.frame(hstats, astats_1)
+data_1$elo <- elo_vec_1
+data_1$opp_elo <- elo_vec_2
+# Join original away and copy of home
+data_2 <- cbind.data.frame(astats, hstats_1)
+data_2$elo <- elo_vec_2
+data_2$opp_elo <- elo_vec_1
+
+# Create location columns - Changed to binary
+data_1$location <- 1
+data_2$location <- 0
+
+# Create winner columns
+data_1$winner <- as.numeric(as.character(mod_dat2$winner))
+data_2$winner <- abs(1 - as.numeric(as.character(mod_dat2$winner)))
+
+# Create point differential columns
+data_1$point_diff <- mod_dat2$point_dif
+data_2$point_diff <- -mod_dat2$point_dif
+
+# Rejoin data
+use_data <- rbind.data.frame(cbind.data.frame(game_stats, data_1),
+                             cbind.data.frame(game_stats, data_2))
+
+# Add relevant interaction terms
+use_data$run_int <- use_data$avg_run_epa * use_data$avg_run_epa_def_opp
+use_data$pass_int <- use_data$avg_pass_epa * use_data$avg_pass_epa_def_opp
+use_data$def_run_int <- use_data$avg_run_epa_def * use_data$avg_run_epa_opp
+use_data$def_pass_int <- use_data$avg_pass_epa_def * use_data$avg_pass_epa_opp
+
+# Check stats are correctly linked
+use_data[use_data$game_id == "2019_08_TB_TEN",]
+```
+
+## Creating Data Frame of Deviations from League Averages
+```{r}
+
+pred_dat <- use_data[, c("run_epa", "pass_epa",       
+                            "avg_run_epa", "avg_pass_epa", 
+                            "runs_per_game", "pass_per_game",
+                         "run_epa_def", "pass_epa_def",
+                                            "avg_run_epa_def", "avg_pass_epa_def", 
+                                            "runs_per_game_def","pass_per_game_def",
+                         "run_epa_opp", "pass_epa_opp",       
+                            "avg_run_epa_opp", "avg_pass_epa_opp", 
+                            "runs_per_game_opp", "pass_per_game_opp",
+                         "run_epa_def_opp", "pass_epa_def_opp",
+                                            "avg_run_epa_def_opp", "avg_pass_epa_def_opp", 
+                                            "runs_per_game_def_opp","pass_per_game_def_opp")]
+# Extract means of variables
+mean_vec <- colMeans(pred_dat, na.rm = TRUE)
+# Name mean variables
+names(mean_vec) <- names(pred_dat)
+# Create deviation from league average data frame
+dev_dat <- t(t(pred_dat) - mean_vec)
+```
+
+## Creating Derived Variables Using Means and Deviations
+```{r}
+  dev_db_store <- as.data.frame(dev_dat)
+  # Create a data frame to store calculated variables
+  calc_db <- as.data.frame(matrix(NA, nrow = nrow(use_data), ncol = 8))
+  # Name columns in calculated variable data frame
+  names(calc_db) <- c("runs", "passes", "run_epa", "pass_epa",
+                      "opp_runs", "opp_passes", "opp_run_epa", "opp_pass_epa")
+  
+  calc_db$runs <- dev_db_store$runs_per_game + 
+      dev_db_store$runs_per_game_def_opp + 
+      mean_vec[colnames(dev_dat) == "runs_per_game"]
+  
+   calc_db$passes <- dev_db_store$pass_per_game +
+      dev_db_store$pass_per_game_def_opp +
+      mean_vec[colnames(dev_dat) == "pass_per_game"]
+   
+    calc_db$run_epa <- dev_db_store$avg_run_epa -
+      dev_db_store$avg_run_epa_def_opp +
+      mean_vec[colnames(dev_dat) == "avg_run_epa"]
+   
+    calc_db$pass_epa <- dev_db_store$avg_pass_epa -
+      dev_db_store$avg_pass_epa_def_opp +
+      mean_vec[colnames(dev_dat) == "avg_pass_epa"]
+   
+     calc_db$opp_runs <- dev_db_store$runs_per_game_opp + 
+      dev_db_store$runs_per_game_def + 
+      mean_vec[colnames(dev_dat) == "runs_per_game"]
+     
+         # Calculate away passes as away deviation + home defensive deviation + mean passes
+    calc_db$opp_passes <- dev_db_store$pass_per_game_opp +
+      dev_db_store$pass_per_game_def +
+      mean_vec[colnames(dev_dat) == "pass_per_game"]
+    
+        # Calculate away average run epa as away deviation - home defensive deviation + mean run epa
+    calc_db$opp_run_epa <- dev_db_store$avg_run_epa_opp -
+      dev_db_store$avg_run_epa_def +
+      mean_vec[colnames(dev_dat) == "avg_run_epa"]
+    
+        # Calculate away average pass epa as away deviation - home defensive deviation + mean pass epa
+    calc_db$opp_pass_epa <- dev_db_store$avg_pass_epa_opp -
+      dev_db_store$avg_pass_epa_def +
+      mean_vec[colnames(dev_dat) == "avg_pass_epa"]
+    
+    # Calculate home total run EPA as expected home runs * home runs EPA
+  calc_db$total_run_epa <- calc_db$runs * calc_db$run_epa
+  # Calculate home total pass EPA as expected home passes * home passes epa
+  calc_db$total_pass_epa <- calc_db$passes * calc_db$pass_epa
+  # Calculate away total run EPA as expected away runs * away run epa
+  calc_db$opp_total_run_epa <- calc_db$opp_runs * calc_db$opp_run_epa
+  # Calculate away total pass EPA as expected away passes *  away pass epa
+  calc_db$opp_total_pass_epa <- calc_db$opp_passes * calc_db$opp_pass_epa
+  
+  # Predict home expected points as home run epa + home pass epa
+  calc_db$points <- calc_db$total_run_epa + calc_db$total_pass_epa
+  # Predict away expected points as away run epa + away pass epa
+  calc_db$opp_points <- calc_db$opp_total_run_epa + calc_db$opp_total_pass_epa
+  # Return calculated results
+  calc_db$predicted_score <- calc_db$points - calc_db$opp_points
+```
+
+## Adding Derived Variables to use_data
+```{r}
+use_data <- cbind.data.frame(use_data, calc_db)
+```
+
+## Inspecting the Response Variable (Balanced)
+```{r}
+summary(use_data$winner)
+```
+
+## Additional Summary Statistics
+```{r}
+summary(use_data)
+```
+
+Though there are duplicate columns for winner and point differential, we rectified this issue while initializing the dtrain and dtest matrices for XGBoost.
+
+## Segmenting the Dataset
+```{r}
+# Segment based on index 300
+train_dat <- use_data[use_data$index < 300, ]
+ 
+test_dat <- use_data[use_data$index >= 300, ]
+
+nrow(train_dat)
+nrow(test_dat)
+```
+
+This is a reasonable split, with 8398 observations in the training data and 1336 in the test data.
+
+## Preparing Data for XGBoost
+```{r}
+dtrain <- xgb.DMatrix(data = as.matrix(train_dat[, c(12:29, 31:51, 54:72)]), label = as.numeric(train_dat$winner) - 1)
+
+dtest <- xgb.DMatrix(data = as.matrix(test_dat[, c(12:29, 31:51, 54:72)]), label = as.numeric(test_dat$winner) - 1)
+```
+
+To initiate our XGBoost modeling process, we created the dtrain and dtest numeric matrices to store our training and test datasets, respectively.  In creating these objects, we filtered out the first 11 columns from train_dat and test_dat, removing the initial point differential and winner columns along with a number of counterproductive variables tracking logistical information for each game.  We also selectively skipped over the categorical team_opp column, containing the name of each opposing team, and the two final response variable columns winner and point_diff. At this point, deciding to pursue a classification approach, we selected this recently omitted winner column as our response variable.  Hence, point differential would no longer serve as a response variable or predictor in our models.
+
+## Tuning the Number of Trees
+```{r xgboost param tuning}
+# Use xgb.cv to run cross-validation inside xgboost
+set.seed(111111)
+bst <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+               eta = 0.1, # Set learning rate
+              
+               nrounds = 1000, # Set number of rounds
+               early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+               
+               verbose = 1, # 1 - Prints out fit
+               nthread = 6, # Set number of parallel threads
+               print_every_n = 20, # Prints out result every 20th iteration
+              
+               objective = "binary:logistic", # Set objective
+               eval_metric = "auc",
+               eval_metric = "error") # Set evaluation metric to use
+
+g_1 <- ggplot(bst$evaluation_log, aes(x = iter, y = test_error_mean)) +
+  geom_point(alpha = 0.5, color = "blue") + 
+  geom_smooth() + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank(), 
+        panel.background = element_blank()) + 
+  labs(x = "Number of Trees", title = "Error Rate v Number of Trees",
+       y = "Error Rate")
+g_1
+```
+
+With 59 iterations minimizing the error rate within the validation data at 0.321, we chose to set early_stopping_rounds at 60 for the next tuning steps.
+
+## Tuning Max Depth and Min Child Weight
+```{r tune xgb params 1}
+
+max_depth_vals <- c(3, 5, 7, 10, 15) # Create vector of max depth values
+min_child_weight <- c(1,3,5,7, 10, 15) # Create vector of min child values
+
+# Expand grid of parameter values
+cv_params <- expand.grid(max_depth_vals, min_child_weight)
+names(cv_params) <- c("max_depth", "min_child_weight")
+# Create results vector
+auc_vec <- error_vec <- rep(NA, nrow(cv_params)) 
+# Loop through results
+for(i in 1:nrow(cv_params)){
+  set.seed(111111)
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = 0.1, # Set learning rate
+              max.depth = cv_params$max_depth[i], # Set max depth
+              min_child_weight = cv_params$min_child_weight[i], # Set minimum number of samples in node to split
+             
+               
+              nrounds = 100, # Set number of rounds
+              early_stopping_rounds = 60, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 6, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+               
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc", # Set evaluation metric to use
+              eval_metric = "error") # Set evaluation metric to use
+  auc_vec[i] <- bst_tune$evaluation_log$test_auc_mean[bst_tune$best_ntreelimit]
+  error_vec[i] <- bst_tune$evaluation_log$test_error_mean[bst_tune$best_ntreelimit]
+  
+}
+
+```
+
+```{r Visualise Tune 1}
+# Join results in dataset
+res_db <- cbind.data.frame(cv_params, auc_vec, error_vec)
+names(res_db)[3:4] <- c("auc", "error") 
+res_db$max_depth <- as.factor(res_db$max_depth) # Convert tree number to factor for plotting
+res_db$min_child_weight <- as.factor(res_db$min_child_weight) # Convert node size to factor for plotting
+# Print AUC heatmap
+g_2 <- ggplot(res_db, aes(y = max_depth, x = min_child_weight, fill = auc)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+    mid = "white", # Choose mid color
+    high = "red", # Choose high color
+    midpoint =mean(res_db$auc), # Choose mid point
+    space = "Lab", 
+    na.value ="grey", # Choose NA value
+    guide = "colourbar", # Set color bar
+    aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Minimum Child Weight", y = "Max Depth", fill = "AUC") # Set labels
+g_2 # Generate plot
+
+# print error heatmap
+g_3 <- ggplot(res_db, aes(y = max_depth, x = min_child_weight, fill = error)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+    mid = "white", # Choose mid color
+    high = "red", # Choose high color
+    midpoint =mean(res_db$error), # Choose mid point
+    space = "Lab", 
+    na.value ="grey", # Choose NA value
+    guide = "colourbar", # Set color bar
+    aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Minimum Child Weight", y = "Max Depth", fill = "Error") # Set labels
+g_3 # Generate plot
+```
+```{r}
+res_db
+```
+
+Employing a max depth of 5 and minimum child weight of 5 yielded the optimal combination of high validation AUC (0.630) and low validation error (0.390).  Thus, we set both max_depth and min_child_weight to 5 in the following tuning steps.
+
+## Tuning Gamma
+```{r gamma tuning}
+gamma_vals <- c(0, 0.05, 0.1, 0.15, 0.2) # Create vector of gamma values
+
+# Be Careful - This can take a very long time to run
+set.seed(111111)
+auc_vec <- error_vec <- rep(NA, length(gamma_vals))
+for(i in 1:length(gamma_vals)){
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = 0.1, # Set learning rate
+              max.depth = 5, # Set max depth
+              min_child_weight = 5, # Set minimum number of samples in node to split
+              gamma = gamma_vals[i], # Set minimum loss reduction for split
+
+              
+               
+              nrounds = 100, # Set number of rounds
+              early_stopping_rounds = 60, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 1, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+               
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc", # Set evaluation metric to use
+              eval_metric = "error") # Set evaluation metric to use
+  auc_vec[i] <- bst_tune$evaluation_log$test_auc_mean[bst_tune$best_ntreelimit]
+  error_vec[i] <- bst_tune$evaluation_log$test_error_mean[bst_tune$best_ntreelimit]
+  
+}
+```
+
+```{r Gamma res}
+# Join gamma to values
+cbind.data.frame(gamma_vals, auc_vec, error_vec)
+```
+
+A gamma value of 0.1 yielded both the lowest validation error rate (0.387) and the highest validation AUC (0.634).  Hence, we set gamma to 0.1 for the rest of our tuning process.
+
+## Tuning the Number of Trees (Given New Hyperparameter Values)
+```{r choose xgboost tree number 2}
+# Use xgb.cv to run cross-validation inside xgboost
+set.seed(111111)
+bst <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = 0.1, # Set learning rate
+              max.depth = 5, # Set max depth
+              min_child_weight = 5, # Set minimum number of samples in node to split
+              gamma = 0.1, # Set minimum loss reduction for split
+             
+               
+              nrounds = 1000, # Set number of rounds
+              early_stopping_rounds = 60, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 6, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+               
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc",
+              eval_metric = "error") # Set evaluation metric to use
+
+g_2 <- ggplot(bst$evaluation_log, aes(x = iter, y = test_error_mean)) +
+  geom_point(alpha = 0.5, color = "blue") + 
+  geom_smooth() + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank(), 
+        panel.background = element_blank()) + 
+  labs(x = "Number of Trees", title = "Error Rate v Number of Trees",
+       y = "Error Rate")
+g_2
+```
+
+With 73 iterations minimizing the error rate within the validation data at 0.332, we chose to set early_stopping_rounds at 75 for the few remaining tuning steps.
+
+## Tuning the Subsample and Column Sample
+```{r tune xgb samples}
+
+subsample <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of subsample values
+colsample_by_tree <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of col sample values
+
+# Expand grid of tuning parameters
+cv_params <- expand.grid(subsample, colsample_by_tree)
+names(cv_params) <- c("subsample", "colsample_by_tree")
+# Create vectors to store results
+auc_vec <- error_vec <- rep(NA, nrow(cv_params)) 
+# Loop through parameter values
+for(i in 1:nrow(cv_params)){
+  set.seed(111111)
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = 0.1, # Set learning rate
+              max.depth = 5, # Set max depth
+              min_child_weight = 5, # Set minimum number of samples in node to split
+              gamma = 0.1, # Set minimum loss reduction for split
+              subsample = cv_params$subsample[i], # Set proportion of training data to use in tree
+              colsample_bytree = cv_params$colsample_by_tree[i], # Set number of variables to use in each tree
+               
+              nrounds = 100, # Set number of rounds
+              early_stopping_rounds = 75, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 6, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+               
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc", # Set evaluation metric to use
+              eval_metric = "error") # Set evaluation metric to use
+  auc_vec[i] <- bst_tune$evaluation_log$test_auc_mean[bst_tune$best_ntreelimit]
+  error_vec[i] <- bst_tune$evaluation_log$test_error_mean[bst_tune$best_ntreelimit]
+  
+}
+
+```
+
+
+```{r visualise tuning sample params}
+
+res_db <- cbind.data.frame(cv_params, auc_vec, error_vec)
+names(res_db)[3:4] <- c("auc", "error") 
+res_db$subsample <- as.factor(res_db$subsample) # Convert tree number to factor for plotting
+res_db$colsample_by_tree <- as.factor(res_db$colsample_by_tree) # Convert node size to factor for plotting
+g_4 <- ggplot(res_db, aes(y = colsample_by_tree, x = subsample, fill = auc)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+    mid = "white", # Choose mid color
+    high = "red", # Choose high color
+    midpoint =mean(res_db$auc), # Choose mid point
+    space = "Lab", 
+    na.value ="grey", # Choose NA value
+    guide = "colourbar", # Set color bar
+    aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Subsample", y = "Column Sample by Tree", fill = "AUC") # Set labels
+g_4 # Generate plot
+
+
+g_5 <- ggplot(res_db, aes(y = colsample_by_tree, x = subsample, fill = error)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+    mid = "white", # Choose mid color
+    high = "red", # Choose high color
+    midpoint =mean(res_db$error), # Choose mid point
+    space = "Lab", 
+    na.value ="grey", # Choose NA value
+    guide = "colourbar", # Set color bar
+    aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Subsample", y = "Column Sample by Tree", fill = "Error") # Set labels
+g_5 # Generate plot
+```
+```{r}
+res_db
+```
+Employing a subsample of 0.6 and column sample of 1 yielded the optimal combination of high validation AUC (0.633) and low validation error (0.392).  Though having a slightly higher error rate than the the subsample of 0.6 and column sample of 0.9, this combination more than offset the marginally increased error with a substantially improved AUC. Given these considerations, we set subsample to 0.6 and colsample_bytree to 1 for the final tuning steps.
+
+## Tuning ETA
+```{r eta tuning}
+
+# Use xgb.cv to run cross-validation inside xgboost
+set.seed(111111)
+bst_mod_1 <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = 0.3, # Set learning rate
+              max.depth = 5, # Set max depth
+              min_child_weight = 5, # Set minimum number of samples in node to split
+              gamma = 0.1, # Set minimum loss reduction for split
+              subsample = 0.6, # Set proportion of training data to use in tree
+              colsample_bytree =  1, # Set number of variables to use in each tree
+               
+              nrounds = 1000, # Set number of rounds
+              early_stopping_rounds = 75, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 6, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+              
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc",
+              eval_metric = "error") # Set evaluation metric to use
+
+
+set.seed(111111)
+bst_mod_2 <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = 0.1, # Set learning rate
+              max.depth =  5, # Set max depth
+              min_child_weight = 5, # Set minimum number of samples in node to split
+              gamma = 0.1, # Set minimum loss reduction for split
+              subsample = 0.6 , # Set proportion of training data to use in tree
+              colsample_bytree = 1, # Set number of variables to use in each tree
+               
+              nrounds = 1000, # Set number of rounds
+              early_stopping_rounds = 75, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 6, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+              
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc",
+              eval_metric = "error") # Set evaluation metric to use
+set.seed(111111)
+bst_mod_3 <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = 0.05, # Set learning rate
+              max.depth = 5, # Set max depth
+              min_child_weight = 5, # Set minimum number of samples in node to split
+              gamma = 0.1, # Set minimum loss reduction for split
+              subsample = 0.6 , # Set proportion of training data to use in tree
+              colsample_bytree =  1, # Set number of variables to use in each tree
+               
+              nrounds = 1000, # Set number of rounds
+              early_stopping_rounds = 75, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 6, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+              
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc",
+              eval_metric = "error") # Set evaluation metric to use
+set.seed(111111)
+bst_mod_4 <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = 0.01, # Set learning rate
+              max.depth = 5, # Set max depth
+              min_child_weight = 5, # Set minimum number of samples in node to split
+              gamma = 0.1, # Set minimum loss reduction for split
+              subsample = 0.6, # Set proportion of training data to use in tree
+              colsample_bytree = 1, # Set number of variables to use in each tree
+               
+              nrounds = 1000, # Set number of rounds
+              early_stopping_rounds = 75, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 6, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+              
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc",
+              eval_metric = "error") # Set evaluation metric to use
+
+set.seed(111111)
+bst_mod_5 <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+              eta = 0.005, # Set learning rate
+              max.depth = 5, # Set max depth
+              min_child_weight = 5, # Set minimum number of samples in node to split
+              gamma = 0.1, # Set minimum loss reduction for split
+              subsample = 0.6, # Set proportion of training data to use in tree
+              colsample_bytree = 1, # Set number of variables to use in each tree
+               
+              nrounds = 1000, # Set number of rounds
+              early_stopping_rounds = 75, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 6, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+               
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc",
+              eval_metric = "error") # Set evaluation metric to use
+```
+
+```{r eta plots}
+
+# Extract results for model with eta = 0.3
+pd1 <- cbind.data.frame(bst_mod_1$evaluation_log[,c("iter", "test_error_mean")], rep(0.3, nrow(bst_mod_1$evaluation_log)))
+names(pd1)[3] <- "eta"
+# Extract results for model with eta = 0.1
+pd2 <- cbind.data.frame(bst_mod_2$evaluation_log[,c("iter", "test_error_mean")], rep(0.1, nrow(bst_mod_2$evaluation_log)))
+names(pd2)[3] <- "eta"
+# Extract results for model with eta = 0.05
+pd3 <- cbind.data.frame(bst_mod_3$evaluation_log[,c("iter", "test_error_mean")], rep(0.05, nrow(bst_mod_3$evaluation_log)))
+names(pd3)[3] <- "eta"
+# Extract results for model with eta = 0.01
+pd4 <- cbind.data.frame(bst_mod_4$evaluation_log[,c("iter", "test_error_mean")], rep(0.01, nrow(bst_mod_4$evaluation_log)))
+names(pd4)[3] <- "eta"
+# Extract results for model with eta = 0.005
+pd5 <- cbind.data.frame(bst_mod_5$evaluation_log[,c("iter", "test_error_mean")], rep(0.005, nrow(bst_mod_5$evaluation_log)))
+names(pd5)[3] <- "eta"
+# Join datasets
+plot_data <- rbind.data.frame(pd1, pd2, pd3, pd4, pd5)
+# Converty ETA to factor
+plot_data$eta <- as.factor(plot_data$eta)
+# Plot points
+g_6 <- ggplot(plot_data, aes(x = iter, y = test_error_mean, color = eta))+
+  geom_point(alpha = 0.5) +
+  theme_bw() + # Set theme
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+  labs(x = "Number of Trees", title = "Error Rate v Number of Trees",
+       y = "Error Rate", color = "Learning \n Rate")  # Set labels
+g_6
+
+# Plot lines
+g_7 <- ggplot(plot_data, aes(x = iter, y = test_error_mean, color = eta))+
+  geom_smooth(alpha = 0.5) +
+  theme_bw() + # Set theme
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+  labs(x = "Number of Trees", title = "Error Rate v Number of Trees",
+       y = "Error Rate", color = "Learning \n Rate")  # Set labels
+g_7
+
+```
+Given this chart and the previous model output, it appears that utilizing an ETA value of 0.05 with 109 trees minimzes the validation error rate at about 0.390.  Thus, we chose to set ETA at 0.05 and nrounds/early_stopping_rounds at 110 for our final model.
+
+## Running the Final Model
+```{r fit final xgb model}
+set.seed(111111)
+bst_final <- xgboost(data = dtrain, # Set training data
+            
+              eta = 0.05, # Set learning rate
+              max.depth =  5, # Set max depth
+              min_child_weight = 5, # Set minimum number of samples in node to split
+              gamma = 0.1, # Set minimum loss reduction for split
+              subsample =  0.6, # Set proportion of training data to use in tree
+              colsample_bytree = 1, # Set number of variables to use in each tree
+               
+              nrounds = 109, # Set number of rounds
+              early_stopping_rounds = 109, # Set number of rounds to stop at if there is no improvement
+               
+              verbose = 1, # 1 - Prints out fit
+              nthread = 6, # Set number of parallel threads
+              print_every_n = 20, # Prints out result every 20th iteration
+              
+              objective = "binary:logistic", # Set objective
+              eval_metric = "auc",
+              eval_metric = "error") # Set evaluation metric to use
+```
+
+```{r final xgb_preds}
+
+boost_preds <- predict(bst_final, dtrain) # Create predictions for XGBoost model on training data
+
+pred_dat <- cbind.data.frame(boost_preds , train_dat$winner)#
+names(pred_dat) <- c("predictions", "response")
+oc<- optimal.cutpoints(X = "predictions",
+                       status = "response",
+                       tag.healthy = 0,
+                       data = pred_dat,
+                       methods = "MaxEfficiency")
+
+boost_preds <- predict(bst_final, dtest) # Create predictions for XGBoost model on testing data
+
+pred_dat <- cbind.data.frame(boost_preds , test_dat$winner)
+# Convert predictions to classes, using optimal cut-off
+boost_pred_class <- rep(0, length(boost_preds))
+boost_pred_class[boost_preds >= oc$MaxEfficiency$Global$optimal.cutoff$cutoff[1]] <- 1
+
+
+t <- table(boost_pred_class, test_dat$winner) # Create table
+confusionMatrix(t, positive = "1") # Produce confusion matrix
+```
+```{r}
+# Calculate and plot final model ROC
+roc1 = roc(test_dat$winner, boost_preds)
+plot.roc(roc1, print.auc = TRUE, col = "red", print.auc.col = "red")
+```
+
+## Extracting Variable Importance
+```{r}
+# Extract importance
+imp_mat <- xgb.importance(model = bst_final)
+# Plot importance (top 10 variables)
+xgb.plot.importance(imp_mat, top_n = 10)
+```
+
+
+
+
+
+
