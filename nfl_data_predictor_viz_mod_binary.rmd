@@ -1,6 +1,6 @@
 ---
 title: "nfl_data_predictor_viz"
-author: "Jeff"
+author: "Jeremy"
 date: "9/16/2021"
 output: html_document
 ---
